@@ -9,15 +9,14 @@ Script para:
    - Gera/atualiza failed_runs.parquet.
 
 2) Construir df_ct_taxonomy a partir de df_marmags_final.parquet
-   - Gera df_ct_taxonomy.parquet, replicando a lógica do Breno
-     usando as colunas GTDB_Tk_*.
+   - Gera df_ct_taxonomy.parquet.
 
 3) Consultar NCBI para tax_id específico de cada organism
    - Gera/atualiza df_tax_id.parquet (com retomada e backoff e schema fixo!).
 
 4) Montar df_samples (tabela final por MAG) juntando tudo
    - Calcula genome coverage = base_count / genome_length (fallback = "9")
-   - Aplica correções de formato (ENA-friendly) para completeness, datas etc.
+   - Aplica correções de formato (ENA-friendly)
    - Gera df_samples.parquet e df_samples.tsv.
 """
 
@@ -34,8 +33,6 @@ from tqdm import tqdm
 # ---------------------------------------------------
 # CONFIG: nome da coluna com tamanho do genoma no df_marmags
 # ---------------------------------------------------
-# Troque aqui se no seu df_marmags o nome da coluna de tamanho
-# do genoma for outro.
 GENOME_LENGTH_COL = "BBTools_scaf_bp"
 
 # ---------------------------------------------------
@@ -229,7 +226,6 @@ def build_df_experiments(df_marmags: pl.DataFrame) -> pl.DataFrame:
             if run_acc in completed_runs:
                 continue
 
-            success = False
             for attempt, wait in enumerate(backoff):
                 if wait > 0:
                     print(f"[{run_acc}] Tentativa {attempt+1}, esperando {wait}s...")
@@ -238,7 +234,6 @@ def build_df_experiments(df_marmags: pl.DataFrame) -> pl.DataFrame:
                     out = process_single_run(run_acc)
                     df_experiments = pl.concat([df_experiments, out])
                     completed_runs.add(run_acc)
-                    success = True
                     break
                 except Exception as e:
                     print(f"[ERRO] RUN {run_acc} tentativa {attempt+1}: {e}")
@@ -257,20 +252,19 @@ def build_df_experiments(df_marmags: pl.DataFrame) -> pl.DataFrame:
 
 # ---------------------------------------------------
 # Parte 2: df_ct_taxonomy a partir de df_marmags_final
-# (adaptando a lógica do Breno para GTDB_Tk_*)
 # ---------------------------------------------------
 
 def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
     """
     Monta df_ct_taxonomy a partir de df_marmags_final.
 
-    Lógica de organism inspirada no código do Breno, mas adaptada
-    para as colunas GTDB_Tk_* que aqui já vêm sem prefixos (s__/g__/f__).
+    Lógica de 'organism' inspirada no código do Breno, mas adaptada
+    para GTDB_Tk_* já limpos (sem prefixos d__/p__/g__/s__).
 
     Cadeia de fallback:
       species -> genus -> family -> order -> phylum -> "uncultured bacterium/archaeon"
 
-    domain (para fallback de tax_id):
+    'domain' (para fallback de tax_id):
       Bacteria  -> "77133"
       Archaea   -> "115547"
     """
@@ -290,16 +284,15 @@ def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-    # helper: expressão "tem valor válido" (não nulo, não vazio, não "NA")
     def has_valid(col: str) -> pl.Expr:
         return (
             pl.col(col).is_not_null()
-            & (pl.col(col).str.strip().str.len_chars() > 0)
+            & (pl.col(col).cast(pl.Utf8).str.strip_chars().str.len_chars() > 0)
             & (pl.col(col) != "NA")
         )
 
     df = df.with_columns(
-        # organism (cadeia de fallback)
+        # organism
         pl.when(has_valid("GTDB_Tk_Species"))
         .then(pl.col("GTDB_Tk_Species"))
         .when(has_valid("GTDB_Tk_Genus"))
@@ -488,9 +481,7 @@ def build_df_samples(
         .alias("tax_id")
     )
 
-    # 2) join com df_experiments
-    # df_ct_taxonomy["experiment"] contém o RUN (ex.: SRR...),
-    # df_experiments tem "run" e "experiment" (SRX). Ligamos pelo RUN.
+    # 2) join com df_experiments (experiments = RUN; df_experiments.run = RUN)
     df_samples = df_samples.join(
         df_experiments,
         left_on="experiment",
@@ -531,19 +522,21 @@ def build_df_samples(
     df_samples = df_samples.with_columns(
         # Só a parte antes de ":" em geographic location (country and/or sea)
         pl.col("geographic location (country and/or sea)")
+        .cast(pl.Utf8)
         .str.split(":")
         .list.get(0)
         .alias("geographic location (country and/or sea)"),
 
-        # completeness 100.00 -> 100
-        pl.when(pl.col("completeness score") == "100.00")
+        # completeness 100.00 -> "100" e tudo como string
+        pl.when(pl.col("completeness score") == 100.0)
         .then(pl.lit("100"))
-        .otherwise(pl.col("completeness score"))
+        .otherwise(pl.col("completeness score").cast(pl.Utf8))
         .alias("completeness score"),
 
         # normalização e validação da collection date
         pl.when(
             pl.col("collection date")
+            .cast(pl.Utf8)
             # normalize YYYY → YYYY-01-01
             .str.replace(r'^(\d{4})$', r'\1-01-01')
             # normalize YYYY-MM → YYYY-MM-01
@@ -556,6 +549,7 @@ def build_df_samples(
         )
         .then(
             pl.col("collection date")
+            .cast(pl.Utf8)
             .str.replace(r'^(\d{4})$', r'\1-01-01')
             .str.replace(r'^(\d{4})-(\d{2})$', r'\1-\2-01')
             .str.replace(r'^(\d{4})(\d{2})(\d{2})$', r'\1-\2-\3')
