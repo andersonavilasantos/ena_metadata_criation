@@ -9,13 +9,15 @@ Script para:
    - Gera/atualiza failed_runs.parquet.
 
 2) Construir df_ct_taxonomy a partir de df_marmags_final.parquet
-   - Gera df_ct_taxonomy.parquet.
+   - Gera df_ct_taxonomy.parquet, replicando a lógica do Breno
+     usando as colunas GTDB_Tk_*.
 
 3) Consultar NCBI para tax_id específico de cada organism
    - Gera/atualiza df_tax_id.parquet (com retomada e backoff e schema fixo!).
 
 4) Montar df_samples (tabela final por MAG) juntando tudo
    - Calcula genome coverage = base_count / genome_length (fallback = "9")
+   - Aplica correções de formato (ENA-friendly) para completeness, datas etc.
    - Gera df_samples.parquet e df_samples.tsv.
 """
 
@@ -35,6 +37,17 @@ from tqdm import tqdm
 # Troque aqui se no seu df_marmags o nome da coluna de tamanho
 # do genoma for outro.
 GENOME_LENGTH_COL = "BBTools_scaf_bp"
+
+# ---------------------------------------------------
+# Regex de data no formato aceito pelo ENA (do Breno)
+# ---------------------------------------------------
+
+date_regex = (
+    r'^[12][0-9]{3}(-(0[1-9]|1[0-2])(-(0[1-9]|[12][0-9]|3[01])'
+    r'(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z?([+-][0-9]{1,2})?)?)?)?'
+    r'(/[0-9]{4}(-[0-9]{2}(-[0-9]{2}'
+    r'(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z?([+-][0-9]{1,2})?)?)?)?)?$'
+)
 
 # ---------------------------------------------------
 # Helpers gerais
@@ -243,12 +256,21 @@ def build_df_experiments(df_marmags: pl.DataFrame) -> pl.DataFrame:
     return df_experiments
 
 # ---------------------------------------------------
-# Parte 2: df_ct_taxonomy
+# Parte 2: df_ct_taxonomy a partir de df_marmags_final
+# (adaptando a lógica do Breno para GTDB_Tk_*)
 # ---------------------------------------------------
 
 def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
     """
-    Monta df_ct_taxonomy a partir de df_marmags_final.
+    Monta df_ct_taxonomy a partir de df_marmags_final,
+    replicando a lógica do Breno:
+
+    - Usa GTDB_Tk_Species, GTDB_Tk_Genus, GTDB_Tk_Family, GTDB_Tk_Order, GTDB_Tk_Phylum
+      com a mesma cadeia de fallback:
+        species → genus → family → order → phylum → "uncultured bacterium/archaeon"
+
+    - Usa GTDB_Tk_Domain para decidir Bacteria x Archaea e gerar
+      o domínio genérico (77133 / 115547) para fallback de tax_id.
     """
     df = df_marmags.select(
         [
@@ -266,29 +288,96 @@ def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
+    # Lógica tipo GTDB (d__ / p__ / g__ / s__) adaptada às colunas GTDB_Tk_*
     df = df.with_columns(
-        # organism
         pl.when(
             pl.col("GTDB_Tk_Species").is_not_null()
-            & (pl.col("GTDB_Tk_Species") != "NA")
-            & (pl.col("GTDB_Tk_Species") != "")
+            & pl.col("GTDB_Tk_Species").str.contains("s__")
+            & (
+                pl.col("GTDB_Tk_Species")
+                .str.split("s__")
+                .list.get(1)
+                .str.len_chars() > 0
+            )
         )
-        .then(pl.col("GTDB_Tk_Species"))
-        .when(pl.col("GTDB_Tk_Genus").is_not_null())
         .then(
-            pl.col("GTDB_Tk_Genus")
-            + pl.when(pl.col("gtdb_domain") == "Bacteria")
+            pl.col("GTDB_Tk_Species")
+            .str.split("s__")
+            .list.get(1)
+        )
+        .when(
+            pl.col("GTDB_Tk_Genus").is_not_null()
+            & pl.col("GTDB_Tk_Genus").str.contains("g__")
+            & (
+                pl.col("GTDB_Tk_Genus")
+                .str.split("g__")
+                .list.get(1)
+                .str.len_chars() > 0
+            )
+        )
+        .then(
+            pl.col("GTDB_Tk_Genus").str.split("g__").list.get(1)
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+              .then(pl.lit(" bacterium"))
+              .otherwise(pl.lit(" archaeon"))
+        )
+        .when(
+            pl.col("GTDB_Tk_Family").is_not_null()
+            & pl.col("GTDB_Tk_Family").str.contains("f__")
+            & (
+                pl.col("GTDB_Tk_Family")
+                .str.split("f__")
+                .list.get(1)
+                .str.len_chars() > 0
+            )
+        )
+        .then(
+            pl.col("GTDB_Tk_Family").str.split("f__").list.get(1)
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+              .then(pl.lit(" bacterium"))
+              .otherwise(pl.lit(" archaeon"))
+        )
+        .when(
+            pl.col("GTDB_Tk_Order").is_not_null()
+            & pl.col("GTDB_Tk_Order").str.contains("o__")
+            & (
+                pl.col("GTDB_Tk_Order")
+                .str.split("o__")
+                .list.get(1)
+                .str.len_chars() > 0
+            )
+        )
+        .then(
+            pl.col("GTDB_Tk_Order").str.split("o__").list.get(1)
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+              .then(pl.lit(" bacterium"))
+              .otherwise(pl.lit(" archaeon"))
+        )
+        .when(
+            pl.col("GTDB_Tk_Phylum").is_not_null()
+            & pl.col("GTDB_Tk_Phylum").str.contains("p__")
+            & (
+                pl.col("GTDB_Tk_Phylum")
+                .str.split("p__")
+                .list.get(1)
+                .str.len_chars() > 0
+            )
+        )
+        .then(
+            pl.col("GTDB_Tk_Phylum").str.split("p__").list.get(1)
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
               .then(pl.lit(" bacterium"))
               .otherwise(pl.lit(" archaeon"))
         )
         .otherwise(
-            pl.when(pl.col("gtdb_domain") == "Bacteria")
+            pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
             .then(pl.lit("uncultured bacterium"))
             .otherwise(pl.lit("uncultured archaeon"))
         )
         .alias("organism"),
-        # domain como tax_id genérico
-        pl.when(pl.col("gtdb_domain") == "Bacteria")
+
+        # domain genérico como tax_id (Bacteria / Archaea)
+        pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
         .then(pl.lit("77133"))
         .otherwise(pl.lit("115547"))
         .alias("domain"),
@@ -409,7 +498,7 @@ def build_df_tax_id(df_ct_taxonomy: pl.DataFrame) -> pl.DataFrame:
     return df_tax_id
 
 # ---------------------------------------------------
-# Parte 4: df_samples final (join + coverage)
+# Parte 4: df_samples final (join + coverage + formatações ENA)
 # ---------------------------------------------------
 
 def build_df_samples(
@@ -424,7 +513,9 @@ def build_df_samples(
     - df_tax_id       (tax_id)  [fallback para domain se tax_id==null]
     - df_experiments  (metagenomic source, sample derived from, project name, etc., read base count)
     - df_marmags      (genome_length via GENOME_LENGTH_COL)
-    Calcula genome coverage = read_base_count / genome_length (fallback "9").
+
+    Calcula genome coverage = base_count / genome_length (fallback "9").
+    Aplica correções de formato do Breno (completeness, collection date, country/sea).
     """
     # 1) taxonomy + tax_id (fallback para domain)
     df_samples = df_ct_taxonomy.join(df_tax_id, on="sample_name", how="left")
@@ -437,8 +528,8 @@ def build_df_samples(
     )
 
     # 2) join com df_experiments
-    # df_ct_taxonomy["experiment"] contém o RUN (ex.: SRR...), então precisamos
-    # ligar esse campo com df_experiments["run"].
+    # df_ct_taxonomy["experiment"] contém o RUN (ex.: SRR...),
+    # df_experiments tem "run" e "experiment" (SRX). Ligamos pelo RUN.
     df_samples = df_samples.join(
         df_experiments,
         left_on="experiment",
@@ -447,7 +538,6 @@ def build_df_samples(
     )
 
     # 3) adicionar tamanho do genoma a partir do df_marmags
-    # (ajuste GENOME_LENGTH_COL se necessário)
     df_genome_len = df_marmags.select(
         [
             "sample_name",
@@ -476,7 +566,44 @@ def build_df_samples(
         .alias("genome coverage")
     )
 
-    # 5) selecionar colunas na ordem "bonita" parecida com seu exemplo
+    # 5) Correções de formato exigidas pelo ENA (como no código do Breno)
+    df_samples = df_samples.with_columns(
+        # Só a parte antes de ":" em geographic location (country and/or sea)
+        pl.col("geographic location (country and/or sea)")
+        .str.split(":")
+        .list.get(0)
+        .alias("geographic location (country and/or sea)"),
+
+        # completeness 100.00 -> 100
+        pl.when(pl.col("completeness score") == "100.00")
+        .then(pl.lit("100"))
+        .otherwise(pl.col("completeness score"))
+        .alias("completeness score"),
+
+        # normalização e validação da collection date
+        pl.when(
+            pl.col("collection date")
+            # normalize YYYY → YYYY-01-01
+            .str.replace(r'^(\d{4})$', r'\1-01-01')
+            # normalize YYYY-MM → YYYY-MM-01
+            .str.replace(r'^(\d{4})-(\d{2})$', r'\1-\2-01')
+            # normalize YYYYMMDD → YYYY-MM-DD
+            .str.replace(r'^(\d{4})(\d{2})(\d{2})$', r'\1-\2-\3')
+            # valida contra o regex
+            .str.contains(date_regex)
+            .fill_null(False)
+        )
+        .then(
+            pl.col("collection date")
+            .str.replace(r'^(\d{4})$', r'\1-01-01')
+            .str.replace(r'^(\d{4})-(\d{2})$', r'\1-\2-01')
+            .str.replace(r'^(\d{4})(\d{2})(\d{2})$', r'\1-\2-\3')
+        )
+        .otherwise(pl.lit("missing"))
+        .alias("collection date"),
+    )
+
+    # 6) selecionar colunas na ordem "bonita"
     cols_order = [
         "sample_name",
         "completeness score",
@@ -507,9 +634,7 @@ def build_df_samples(
         "genome_length",
     ]
 
-    # mantém apenas as colunas que realmente existem
     cols_order = [c for c in cols_order if c in df_samples.columns]
-
     df_samples = df_samples.select(cols_order)
 
     # salvar
