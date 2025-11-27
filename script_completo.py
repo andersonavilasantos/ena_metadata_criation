@@ -262,15 +262,17 @@ def build_df_experiments(df_marmags: pl.DataFrame) -> pl.DataFrame:
 
 def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
     """
-    Monta df_ct_taxonomy a partir de df_marmags_final,
-    replicando a lógica do Breno:
+    Monta df_ct_taxonomy a partir de df_marmags_final.
 
-    - Usa GTDB_Tk_Species, GTDB_Tk_Genus, GTDB_Tk_Family, GTDB_Tk_Order, GTDB_Tk_Phylum
-      com a mesma cadeia de fallback:
-        species → genus → family → order → phylum → "uncultured bacterium/archaeon"
+    Lógica de organism inspirada no código do Breno, mas adaptada
+    para as colunas GTDB_Tk_* que aqui já vêm sem prefixos (s__/g__/f__).
 
-    - Usa GTDB_Tk_Domain para decidir Bacteria x Archaea e gerar
-      o domínio genérico (77133 / 115547) para fallback de tax_id.
+    Cadeia de fallback:
+      species -> genus -> family -> order -> phylum -> "uncultured bacterium/archaeon"
+
+    domain (para fallback de tax_id):
+      Bacteria  -> "77133"
+      Archaea   -> "115547"
     """
     df = df_marmags.select(
         [
@@ -288,96 +290,55 @@ def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-    # Lógica tipo GTDB (d__ / p__ / g__ / s__) adaptada às colunas GTDB_Tk_*
+    # helper: expressão "tem valor válido" (não nulo, não vazio, não "NA")
+    def has_valid(col: str) -> pl.Expr:
+        return (
+            pl.col(col).is_not_null()
+            & (pl.col(col).str.strip().str.len_chars() > 0)
+            & (pl.col(col) != "NA")
+        )
+
     df = df.with_columns(
-        pl.when(
-            pl.col("GTDB_Tk_Species").is_not_null()
-            & pl.col("GTDB_Tk_Species").str.contains("s__")
-            & (
-                pl.col("GTDB_Tk_Species")
-                .str.split("s__")
-                .list.get(1)
-                .str.len_chars() > 0
-            )
-        )
+        # organism (cadeia de fallback)
+        pl.when(has_valid("GTDB_Tk_Species"))
+        .then(pl.col("GTDB_Tk_Species"))
+        .when(has_valid("GTDB_Tk_Genus"))
         .then(
-            pl.col("GTDB_Tk_Species")
-            .str.split("s__")
-            .list.get(1)
-        )
-        .when(
-            pl.col("GTDB_Tk_Genus").is_not_null()
-            & pl.col("GTDB_Tk_Genus").str.contains("g__")
-            & (
-                pl.col("GTDB_Tk_Genus")
-                .str.split("g__")
-                .list.get(1)
-                .str.len_chars() > 0
-            )
-        )
-        .then(
-            pl.col("GTDB_Tk_Genus").str.split("g__").list.get(1)
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+            pl.col("GTDB_Tk_Genus")
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
               .then(pl.lit(" bacterium"))
               .otherwise(pl.lit(" archaeon"))
         )
-        .when(
-            pl.col("GTDB_Tk_Family").is_not_null()
-            & pl.col("GTDB_Tk_Family").str.contains("f__")
-            & (
-                pl.col("GTDB_Tk_Family")
-                .str.split("f__")
-                .list.get(1)
-                .str.len_chars() > 0
-            )
-        )
+        .when(has_valid("GTDB_Tk_Family"))
         .then(
-            pl.col("GTDB_Tk_Family").str.split("f__").list.get(1)
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+            pl.col("GTDB_Tk_Family")
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
               .then(pl.lit(" bacterium"))
               .otherwise(pl.lit(" archaeon"))
         )
-        .when(
-            pl.col("GTDB_Tk_Order").is_not_null()
-            & pl.col("GTDB_Tk_Order").str.contains("o__")
-            & (
-                pl.col("GTDB_Tk_Order")
-                .str.split("o__")
-                .list.get(1)
-                .str.len_chars() > 0
-            )
-        )
+        .when(has_valid("GTDB_Tk_Order"))
         .then(
-            pl.col("GTDB_Tk_Order").str.split("o__").list.get(1)
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+            pl.col("GTDB_Tk_Order")
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
               .then(pl.lit(" bacterium"))
               .otherwise(pl.lit(" archaeon"))
         )
-        .when(
-            pl.col("GTDB_Tk_Phylum").is_not_null()
-            & pl.col("GTDB_Tk_Phylum").str.contains("p__")
-            & (
-                pl.col("GTDB_Tk_Phylum")
-                .str.split("p__")
-                .list.get(1)
-                .str.len_chars() > 0
-            )
-        )
+        .when(has_valid("GTDB_Tk_Phylum"))
         .then(
-            pl.col("GTDB_Tk_Phylum").str.split("p__").list.get(1)
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+            pl.col("GTDB_Tk_Phylum")
+            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
               .then(pl.lit(" bacterium"))
               .otherwise(pl.lit(" archaeon"))
         )
         .otherwise(
-            pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+            pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
             .then(pl.lit("uncultured bacterium"))
             .otherwise(pl.lit("uncultured archaeon"))
         )
         .alias("organism"),
 
         # domain genérico como tax_id (Bacteria / Archaea)
-        pl.when(pl.col("gtdb_domain").str.contains("Bacteria"))
+        pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
         .then(pl.lit("77133"))
         .otherwise(pl.lit("115547"))
         .alias("domain"),
