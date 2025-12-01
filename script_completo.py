@@ -256,88 +256,142 @@ def build_df_experiments(df_marmags: pl.DataFrame) -> pl.DataFrame:
 
 def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
     """
-    Monta df_ct_taxonomy a partir de df_marmags_final.
+    Monta df_ct_taxonomy a partir de df_marmags_final usando a coluna
+    'GTDB_Tk_classification', que contém a taxonomia GTDB em uma string única
+    no formato:
+        d__Bacteria;p__Proteobacteria;c__...;o__...;f__...;g__...;s__...
 
-    Lógica de 'organism' inspirada no código do Breno, mas adaptada
-    para GTDB_Tk_* já limpos (sem prefixos d__/p__/g__/s__).
+    A lógica de construção de 'organism' replica o código original do
+    CTERRA_prok-table (cadeia de fallback: species -> genus -> family ->
+    order -> phylum -> uncultured bacterium/archaeon), com as seguintes
+    adaptações:
 
-    Cadeia de fallback:
-      species -> genus -> family -> order -> phylum -> "uncultured bacterium/archaeon"
-
-    'domain' (para fallback de tax_id):
-      Bacteria  -> "77133"
-      Archaea   -> "115547"
+      - 'sample_name' e 'experiment' vêm de df_marmags_final
+      - 'domain' é depois convertida para tax_id:
+            Bacteria -> "77133"
+            Archaea  -> "115547"
     """
+
+    # 1) Seleciona colunas relevantes e explode GTDB_Tk_classification
     df = df_marmags.select(
         [
             "sample_name",
             pl.col("experiments").alias("experiment"),
             pl.col("CheckM_Completeness").alias("completeness score"),
             pl.col("CheckM_Contamination").alias("contamination score"),
-            pl.col("GTDB_Tk_Domain").alias("gtdb_domain"),
-            "GTDB_Tk_Phylum",
-            "GTDB_Tk_Class",
-            "GTDB_Tk_Order",
-            "GTDB_Tk_Family",
-            "GTDB_Tk_Genus",
-            "GTDB_Tk_Species",
+            "GTDB_Tk_classification",
         ]
+    ).with_columns(
+        # quebra a classificação em lista e pega cada nível taxonômico
+        pl.col("GTDB_Tk_classification").str.split(";").list.get(0).alias("domain"),
+        pl.col("GTDB_Tk_classification").str.split(";").list.get(1).alias("phylum"),
+        pl.col("GTDB_Tk_classification").str.split(";").list.get(2).alias("class"),
+        pl.col("GTDB_Tk_classification").str.split(";").list.get(3).alias("order"),
+        pl.col("GTDB_Tk_classification").str.split(";").list.get(4).alias("family"),
+        pl.col("GTDB_Tk_classification").str.split(";").list.get(5).alias("genus"),
+        pl.col("GTDB_Tk_classification").str.split(";").list.get(6).alias("species"),
     )
 
-    def has_valid(col: str) -> pl.Expr:
-        return (
-            pl.col(col).is_not_null()
-            & (pl.col(col).cast(pl.Utf8).str.strip_chars().str.len_chars() > 0)
-            & (pl.col(col) != "NA")
-        )
-
+    # 2) Aplica a MESMA lógica do código original com s__/g__/f__/o__/p__
     df = df.with_columns(
-        # organism
-        pl.when(has_valid("GTDB_Tk_Species"))
-        .then(pl.col("GTDB_Tk_Species"))
-        .when(has_valid("GTDB_Tk_Genus"))
-        .then(
-            pl.col("GTDB_Tk_Genus")
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
-              .then(pl.lit(" bacterium"))
-              .otherwise(pl.lit(" archaeon"))
+        pl.when(
+            (pl.col("species").str.contains("s__"))
+            & (
+                pl.col("species")
+                .str.split("s__")
+                .list.get(1)
+                .str.len_chars()
+                > 0
+            )
         )
-        .when(has_valid("GTDB_Tk_Family"))
+        # species conhecida: pega o que vem depois de "s__"
         .then(
-            pl.col("GTDB_Tk_Family")
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
-              .then(pl.lit(" bacterium"))
-              .otherwise(pl.lit(" archaeon"))
+            pl.col("species")
+            .str.split("s__")
+            .list.get(1)
         )
-        .when(has_valid("GTDB_Tk_Order"))
-        .then(
-            pl.col("GTDB_Tk_Order")
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
-              .then(pl.lit(" bacterium"))
-              .otherwise(pl.lit(" archaeon"))
+        .when(
+            (pl.col("genus").str.contains("g__"))
+            & (
+                pl.col("genus")
+                .str.split("g__")
+                .list.get(1)
+                .str.len_chars()
+                > 0
+            )
         )
-        .when(has_valid("GTDB_Tk_Phylum"))
+        # fallback: genus + " bacterium"/" archaeon"
         .then(
-            pl.col("GTDB_Tk_Phylum")
-            + pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
-              .then(pl.lit(" bacterium"))
-              .otherwise(pl.lit(" archaeon"))
+            pl.col("genus").str.split("g__").list.get(1)
+            + pl.when(pl.col("domain") == "d__Bacteria")
+            .then(pl.lit(" bacterium"))
+            .otherwise(pl.lit(" archaeon"))
+        )
+        .when(
+            (pl.col("family").str.contains("f__"))
+            & (
+                pl.col("family")
+                .str.split("f__")
+                .list.get(1)
+                .str.len_chars()
+                > 0
+            )
+        )
+        .then(
+            pl.col("family").str.split("f__").list.get(1)
+            + pl.when(pl.col("domain") == "d__Bacteria")
+            .then(pl.lit(" bacterium"))
+            .otherwise(pl.lit(" archaeon"))
+        )
+        .when(
+            (pl.col("order").str.contains("o__"))
+            & (
+                pl.col("order")
+                .str.split("o__")
+                .list.get(1)
+                .str.len_chars()
+                > 0
+            )
+        )
+        .then(
+            pl.col("order").str.split("o__").list.get(1)
+            + pl.when(pl.col("domain") == "d__Bacteria")
+            .then(pl.lit(" bacterium"))
+            .otherwise(pl.lit(" archaeon"))
+        )
+        .when(
+            (pl.col("phylum").str.contains("p__"))
+            & (
+                pl.col("phylum")
+                .str.split("p__")
+                .list.get(1)
+                .str.len_chars()
+                > 0
+            )
+        )
+        .then(
+            pl.col("phylum").str.split("p__").list.get(1)
+            + pl.when(pl.col("domain") == "d__Bacteria")
+            .then(pl.lit(" bacterium"))
+            .otherwise(pl.lit(" archaeon"))
         )
         .otherwise(
-            pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
+            pl.when(pl.col("domain") == "d__Bacteria")
             .then(pl.lit("uncultured bacterium"))
             .otherwise(pl.lit("uncultured archaeon"))
         )
         .alias("organism"),
 
-        # domain genérico como tax_id (Bacteria / Archaea)
-        pl.when(pl.col("gtdb_domain").str.contains("Bacteria", literal=True))
-        .then(pl.lit("77133"))
-        .otherwise(pl.lit("115547"))
-        .alias("domain"),
-    )
+        # remove o prefixo "d__" para ficar coerente com o código original
+        pl.col("domain").str.strip_prefix("d__").alias("domain"),
 
-    df = df.select(
+        # se ainda quiser fazer algum ajuste em experiment/sample_name
+        # (aqui deixo sem strip_prefix/strip_suffix porque df_marmags_final
+        # já foi preparado antes, mas se quiser imitar 100% o código antigo,
+        # pode descomentar as duas linhas abaixo):
+        # pl.col("experiment").str.strip_prefix("EA"),
+        # pl.col("sample_name").str.strip_suffix(".fa"),
+    ).select(
         [
             "sample_name",
             "experiment",
@@ -348,6 +402,15 @@ def build_df_ct_taxonomy(df_marmags: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
+    # 3) Mapeia domain (Bacteria/Archaea) para tax_id padrão
+    df = df.with_columns(
+        pl.when(pl.col("domain") == "Bacteria")
+        .then(pl.lit("77133"))
+        .otherwise(pl.lit("115547"))
+        .alias("domain")
+    )
+
+    # 4) Salva df_ct_taxonomy.parquet como no script original
     df.write_parquet("df_ct_taxonomy.parquet")
     print("df_ct_taxonomy.parquet salvo.")
     return df
@@ -528,7 +591,7 @@ def build_df_samples(
         .alias("geographic location (country and/or sea)"),
 
         # completeness 100.00 -> "100" e tudo como string
-        pl.when(pl.col("completeness score") == 100.0)
+        pl.when(pl.col("completeness score") == 100.0 | pl.col("completeness score") == "100.00")
         .then(pl.lit("100"))
         .otherwise(pl.col("completeness score").cast(pl.Utf8))
         .alias("completeness score"),
